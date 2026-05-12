@@ -63,11 +63,13 @@ jobs:
           key: ${{ runner.os }}-pip-ytdlp
           restore-keys: ${{ runner.os }}-pip-
 
-      - name: 🛠️ Install tools (ffmpeg, p7zip, yt-dlp)
+      - name: 🛠️ Install tools (ffmpeg, p7zip, yt-dlp, deno, pot-provider)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg p7zip-full
-          pip install yt-dlp
+          pip install yt-dlp bgutil-ytdlp-pot-provider
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
       - name: 🧼 Prepare bin/ and temp
         run: |
@@ -171,7 +173,6 @@ jobs:
 
           cd "$TEMP_DIR"
 
-          # تشخیص اینستاگرام برای اجبار بهترین کیفیت
           if [[ "$URL" =~ instagram\.com ]]; then
             log_info "📸 Instagram detected → forcing best quality"
             YT_FORMAT="bestvideo+bestaudio/best"
@@ -189,7 +190,7 @@ jobs:
             log_success "yt-dlp succeeded"
           else
             log_warning "yt-dlp failed (exit $YT_EXIT), falling back to curl"
-            curl -L --retry 3 --retry-delay 2 --max-time 300 -C - -JLO "$URL" || log_error "curl also failed"
+            curl -LJO --retry 3 --retry-delay 2 --max-time 300 "$URL" || log_error "curl also failed"
           fi
 
           for FILE in *; do
