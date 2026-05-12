@@ -1,0 +1,228 @@
+name: 📦 File Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '🔗 URL to download'
+        required: true
+        type: string
+      yt_quality:
+        description: '🎬 Quality preset (for YouTube only)'
+        required: false
+        default: 'Best quality (video+audio)'
+        type: choice
+        options:
+          - 'Best quality (video+audio)'
+          - '1080p (video+audio)'
+          - '720p (video+audio)'
+          - '480p (video+audio)'
+          - 'Audio only (best)'
+          - 'Compatible (720p MP4)'
+      clean_bin:
+        description: '🧹 Delete all files in bin/ before download'
+        required: false
+        default: false
+        type: boolean
+      skip_existing:
+        description: '⏭️ Skip if same filename already exists in bin/'
+        required: false
+        default: true
+        type: boolean
+      rename_to:
+        description: '✏️ Rename file (optional, extension auto-appended if missing)'
+        required: false
+        type: string
+      max_size_mb:
+        description: '📏 Max file size in MB (abort if exceeded)'
+        required: false
+        type: number
+      split_size_mb:
+        description: '✂️ Split files larger than this MB into 7z volumes (0 = auto-split at 95MB if >100MB)'
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: ⚙️ Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 💾 Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-ytdlp
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: 🛠️ Install tools (ffmpeg, p7zip, yt-dlp)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg p7zip-full
+          pip install yt-dlp
+
+      - name: 🧼 Prepare bin/ and temp
+        run: |
+          mkdir -p bin temp
+          if [[ "${{ github.event.inputs.clean_bin }}" == "true" ]]; then
+            echo "🧹 Clearing bin/ folder"
+            rm -rf bin/*
+          fi
+
+      - name: 🎯 Download and process
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="${{ github.event.inputs.url }}"
+          YT_QUALITY="${{ github.event.inputs.yt_quality }}"
+          SKIP_EXISTING="${{ github.event.inputs.skip_existing }}"
+          RENAME_TO="${{ github.event.inputs.rename_to }}"
+          MAX_SIZE_MB="${{ github.event.inputs.max_size_mb }}"
+          SPLIT_SIZE_MB="${{ github.event.inputs.split_size_mb }}"
+
+          TEMP_DIR="temp"
+          BIN_DIR="../bin"
+
+          log_info()  { echo "ℹ️ $1"; }
+          log_success(){ echo "✅ $1"; }
+          log_error() { echo "❌ $1"; exit 1; }
+          log_warning(){ echo "⚠️ $1"; }
+
+          get_yt_format() {
+            case "$YT_QUALITY" in
+              "Best quality (video+audio)") echo "bestvideo+bestaudio/best" ;;
+              "1080p (video+audio)")        echo "bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
+              "720p (video+audio)")         echo "bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+              "480p (video+audio)")         echo "bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+              "Audio only (best)")          echo "bestaudio" ;;
+              "Compatible (720p MP4)")      echo "22" ;;
+              *)                            echo "bestvideo+bestaudio/best" ;;
+            esac
+          }
+
+          check_file_size() {
+            local file="$1"
+            local max_mb="$2"
+            local size_bytes=$(stat -c%s "$file")
+            local size_mb=$(echo "scale=2; $size_bytes/1048576" | bc)
+            if [[ -n "$max_mb" ]] && (( $(echo "$size_mb > $max_mb" | bc -l) )); then
+              log_error "File size (${size_mb}MB) exceeds limit of ${max_mb}MB"
+            fi
+            echo "$size_mb"
+          }
+
+          split_if_large() {
+            local file="$1"
+            local dest_name="$2"
+            local size_mb="$3"
+            local threshold="$4"
+            if [[ -z "$threshold" || "$threshold" -eq 0 ]]; then
+              if (( $(echo "$size_mb > 100" | bc -l) )); then
+                threshold=95
+                log_warning "File >100MB. Automatically splitting into ${threshold}MB parts."
+              else
+                return 1
+              fi
+            fi
+            if (( $(echo "$size_mb > $threshold" | bc -l) )); then
+              log_info "File >${threshold}MB (${size_mb}MB) → splitting into ${threshold}MB 7z volumes"
+              local base_name="${dest_name%.*}"
+              if ! 7z a -v"${threshold}m" -mx=9 "$BIN_DIR/${base_name}.7z" "$file" > /dev/null; then
+                log_error "7z split failed for $file"
+              fi
+              log_success "Volumes: ${base_name}.7z.001, .7z.002, ..."
+              rm "$file"
+              return 0
+            fi
+            return 1
+          }
+
+          move_to_bin() {
+            local src="$1"
+            local dest_name="$2"
+            local target="$BIN_DIR/$dest_name"
+
+            if [[ "$SKIP_EXISTING" == "true" && -f "$target" ]]; then
+              log_warning "Skipping '$dest_name' (already exists in bin/)"
+              return 0
+            fi
+
+            local size_mb=$(check_file_size "$src" "$MAX_SIZE_MB")
+            if split_if_large "$src" "$dest_name" "$size_mb" "$SPLIT_SIZE_MB"; then
+              return 0
+            fi
+
+            if (( $(echo "$size_mb > 100" | bc -l) )); then
+              log_error "File is ${size_mb}MB (exceeds GitHub 100MB limit) and could not be split. Set split_size_mb to a value <100."
+            fi
+
+            mv "$src" "$target"
+            log_success "Moved → bin/$dest_name (${size_mb}MB)"
+          }
+
+          cd "$TEMP_DIR"
+
+          # تشخیص اینستاگرام برای اجبار بهترین کیفیت
+          if [[ "$URL" =~ instagram\.com ]]; then
+            log_info "📸 Instagram detected → forcing best quality"
+            YT_FORMAT="bestvideo+bestaudio/best"
+          else
+            YT_FORMAT=$(get_yt_format)
+          fi
+
+          log_info "Attempting download with yt-dlp..."
+          set +e
+          yt-dlp --no-playlist -f "$YT_FORMAT" --restrict-filenames -o "%(title)s.%(ext)s" "$URL"
+          YT_EXIT=$?
+          set -e
+
+          if [[ $YT_EXIT -eq 0 ]]; then
+            log_success "yt-dlp succeeded"
+          else
+            log_warning "yt-dlp failed (exit $YT_EXIT), falling back to curl"
+            curl -L --retry 3 --retry-delay 2 --max-time 300 -C - -JLO "$URL" || log_error "curl also failed"
+          fi
+
+          for FILE in *; do
+            [[ -f "$FILE" ]] || continue
+
+            if [[ -n "$RENAME_TO" ]]; then
+              if [[ "$RENAME_TO" != *.* ]]; then
+                ext="${FILE##*.}"
+                FINAL_NAME="${RENAME_TO}.${ext}"
+              else
+                FINAL_NAME="$RENAME_TO"
+              fi
+            else
+              FINAL_NAME="$FILE"
+            fi
+
+            move_to_bin "$FILE" "$FINAL_NAME"
+          done
+
+          cd ..
+          rm -rf "$TEMP_DIR"
+          log_info "Temporary folder removed"
+
+      - name: 📤 Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bin
+          if git diff --cached --quiet; then
+            echo "📭 No changes to commit"
+            exit 0
+          fi
+          git commit -m "📦 File Downloader: ${{ github.event.inputs.url }} [skip ci]"
+          git pull --rebase --autostash origin ${{ github.ref_name }}
+          git push origin HEAD:${{ github.ref_name }}
+          echo "🎉 Success! Files are in the 'bin' folder"
